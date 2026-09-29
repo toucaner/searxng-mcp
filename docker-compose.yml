@@ -1,0 +1,40 @@
+# docker-compose.yml — McpWebSearchService (ASP.NET Core / Kestrel, streamable-HTTP MCP)
+# Builds the local Dockerfile and runs the long-lived HTTP MCP service.
+# Values are placeholders for review; supply real ones via .env (see .env.example).
+
+services:
+  mcp-web-search:
+    image: mcp-web-search:latest
+    container_name: mcp-web-search
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      - SearXNG__BaseUrl=<url>
+      - CategoryInference__BaseUrl=<url>
+      - McpServer__Port=8080
+      - McpServer__Path=/mcp
+      - WazuhLogging__Host=<ip>
+      - Otlp__Endpoint=<url>
+      - ASPNETCORE_URLS=http://+:8080
+      - Logging__LogLevel__Default=Information
+      - Logging__LogLevel__Microsoft.AspNetCore=Warning
+    # Reach services running on the Docker host (e.g. a local OpenAI-compatible LLM).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - mcp-network
+
+networks:
+  mcp-network:
+    driver: bridge

@@ -1,0 +1,95 @@
+# M3 — DTOs and AOT-safe serialization
+
+**Stage:** M3
+**Predecessors:** M1
+**Successors:** M4, M5
+**Can run in parallel with:** M2
+**Requirement source:** `SPEC.md` §2, §4.1, §6.1 (step 6)
+
+## Goal
+
+Define all strongly-typed DTOs and register the `JsonSerializerContext` source generator that
+guarantees Native AOT-compatible serialization. This is the foundation for the HTTP client (M4) and the
+post-processing pipeline (M5).
+
+## Context and constraints
+
+- **`Newtonsoft.Json` is forbidden**; only `System.Text.Json` + `JsonSerializerContext` (source generators).
+- No reflection-based serialization, no `JsonSerializer.Deserialize<object>`.
+- `SearchResultDto` — a record with `Title`, `Url`, `Snippet`, `SourceEngine?` (SPEC §6.1 DTO structure).
+- All DTOs crossing a JSON boundary (SearXNG HTTP response, LLM MCP response) must be in the `JsonSerializerContext`.
+- `naming policy` / `PropertyNameCaseInsensitive` must be set explicitly via `JsonSerializerOptions` in the context.
+
+## Draft Code Graph
+
+```xml
+<DraftCodeGraph>
+  <Models_SearchResultDto_cs FILE="Models/SearchResultDto.cs" TYPE="DTO">
+    <annotation>Result returned to the LLM: Title, Url, Snippet, SourceEngine?.</annotation>
+    <SearchResultDto_CLASS NAME="SearchResultDto" TYPE="RECORD">
+      <SearchResultDto_Title PROPERTY="Title" TYPE="PROPERTY" />
+      <SearchResultDto_Url PROPERTY="Url" TYPE="PROPERTY" />
+      <SearchResultDto_Snippet PROPERTY="Snippet" TYPE="PROPERTY" />
+      <SearchResultDto_SourceEngine PROPERTY="SourceEngine" TYPE="PROPERTY" NULLABLE="true" />
+    </SearchResultDto_CLASS>
+  </Models_SearchResultDto_cs>
+
+  <Models_SearchRequest_cs FILE="Models/SearchRequest.cs" TYPE="DTO">
+    <annotation>Search request input: Query, Categories, TimeRange, Language.</annotation>
+    <SearchRequest_CLASS NAME="SearchRequest" TYPE="RECORD" />
+  </Models_SearchRequest_cs>
+
+  <Models_SearXNGResponse_cs FILE="Models/SearXNGResponse.cs" TYPE="DTO">
+    <annotation>SearXNG API response: an array of results with title/url/content/engine.</annotation>
+    <SearXNGResult_CLASS NAME="SearXNGResult" TYPE="RECORD" />
+    <SearXNGResponse_CLASS NAME="SearXNGResponse" TYPE="RECORD">
+      <SearXNGResponse_Results PROPERTY="results" TYPE="PROPERTY" />
+    </SearXNGResponse_CLASS>
+  </Models_SearXNGResponse_cs>
+
+  <Serialization_McpJsonContext_cs FILE="Serialization/McpJsonContext.cs" TYPE="SERIALIZATION">
+    <annotation>JsonSerializerContext source generator for all DTOs.</annotation>
+    <McpJsonContext_CLASS NAME="McpJsonContext" TYPE="JSON_SERIALIZER_CONTEXT"
+        BASE="JsonSerializerContext">
+      <McpJsonContext_JsonSerializable_ATTRIBUTE="JsonSerializable"
+          TARGET="SearchResultDto" />
+      <McpJsonContext_JsonSerializable_ATTRIBUTE="JsonSerializable"
+          TARGET="SearchRequest" />
+      <McpJsonContext_JsonSerializable_ATTRIBUTE="JsonSerializable"
+          TARGET="SearXNGResponse" />
+      <McpJsonContext_JsonSerializable_ATTRIBUTE="JsonSerializable"
+          TARGET="SearXNGResult" />
+    </McpJsonContext_CLASS>
+  </Serialization_McpJsonContext_cs>
+</DraftCodeGraph>
+```
+
+## Step-by-step Data Flow
+
+1. Create `SearchResultDto` (record, `init` setters): `Title:string`, `Url:string`, `Snippet:string`,
+   `SourceEngine:string?`.
+2. Create `SearchRequest` (record): `Query:string`, `Categories:string`, `TimeRange:string?`, `Language:string`.
+3. Model the SearXNG response DTOs: `SearXNGResult` (`title`, `url`, `content`, `engine`) and
+   `SearXNGResponse` (`results: SearXNGResult[]`). Map property names to the actual SearXNG JSON
+   (snake_case via `[JsonPropertyName]` or case-insensitive options).
+4. Create `McpJsonContext : JsonSerializerContext` with `[JsonSerializable(typeof(...))]` for each DTO.
+5. Verify round-trip: deserialize a sample SearXNG response JSON → `SearXNGResponse`, serialize
+   `SearchResultDto[]` → JSON, without reflection.
+
+## Acceptance Criteria
+
+- [x] `SearchResultDto` — a record with `Title`, `Url`, `Snippet`, `SourceEngine?` (SPEC §6.1). *(verified M3 — `Models/SearchResultDto.cs`: `public record SearchResultDto`; `{ get; init; } string Title = ""`, `{ get; init; } string Url = ""`, `{ get; set; } string Snippet = ""`, `{ get; init; } string? SourceEngine`)*
+- [x] `SearchRequest` contains `Query`, `Categories`, `TimeRange`, `Language`. *(verified M3 — `Models/SearchRequest.cs`: `public record SearchRequest`; `Query:string=string.Empty`, `Categories:string=string.Empty`, `TimeRange:string?`, `Language:string=string.Empty`)*
+- [x] The SearXNG DTOs cover the fields used in M4/M5 (`title`, `url`, `content`, `engine`). *(verified M3 — `Models/SearXNGResult.cs`: record with `[JsonPropertyName("title")]`, `"url"`, `"content"`, `"engine"`; `Models/SearXNGResponse.cs`: `[JsonPropertyName("results")] SearXNGResult[] Results = []`)*
+- [x] `McpJsonContext` — a `JsonSerializerContext` with `[JsonSerializable]` for each DTO; generated by the source generator. *(verified M3 — `Serialization/McpJsonContext.cs`: 6 × `[JsonSerializable(typeof(...))]` (SearchResultDto, SearchResultDto[], SearchRequest, SearXNGResponse, SearXNGResult, SearXNGResult[]); `PropertyNamingPolicy=Unspecified`, `PropertyNameCaseInsensitive=true`)*
+- [x] The `.csproj` does **not** reference `Newtonsoft.Json`. *(verified M3 — the `.csproj` references `System.Text.Json` only via `Microsoft.Extensions.Hosting`; no Newtonsoft; `EnableConfigurationBindingGenerator=true` (ADR-006))*
+- [x] Unit tests (xUnit): round-trip serialize/deserialize of each DTO through `McpJsonContext`; verification of the SearXNG field case-mapping. *(verified M3 — 5 tests in `tests/McpWebSearchService.Tests/DtoSerializationTests.cs`: Serialize/SearchResultDtoArray, Deserialize/SearXNGResponse (snake_case fields: title/url/content/engine), RoundTrip)*
+- [x] AOT publish passes without trim-analysis warnings (AOT checkpoint). *(verified M3 — `dotnet publish -c Release -r win-x64 /p:PublishAot=true`: 0 × IL####; native binary ~12.8 MB)*
+- [x] Code follows `csharp-conventions` (`#region`, XML docs, LDD). *(verified M3 — all 5 files have `#region MODULE_CONTRACT` + GREP_SUMMARY/STRUCTURE, XML `<summary>`/`<remarks>` with [PURPOSE]/[INVARIANTS]/[RATIONALE]/[CHANGES], per-class/file regions)*
+
+## Risks
+
+- Field-name mismatch between SearXNG and the model → verify against a real SearXNG response
+  (parameter: `format=json`); pin the mapping in tests.
+- `Dictionary`/`object` fields in the SearXNG response would break AOT → do not use them; strictly-typed
+  arrays/records only.
